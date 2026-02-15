@@ -11,6 +11,7 @@ egui_extras = { version = "0.22", features = ["image"] }
 env_logger = "0.10.0"
 image = { version = "0.24", default-features = false, features = ["png"] }
 flate2 = "1.0"
+winreg = { version = "0.10", optional = false }
 
 [[bin]]
 name = "nxpf"

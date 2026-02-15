@@ -8,6 +8,10 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
 };
+#[cfg(windows)]
+use std::error::Error;
+#[cfg(windows)]
+use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
@@ -145,9 +149,28 @@ fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: nxpf [compile|view] <path>");
+        eprintln!("Usage: nxpf [compile|view|register] <path>");
         eprintln!("  compile <path.png>  - Convert PNG to NXPF");
         eprintln!("  view <path.nxpf>    - View NXPF file");
+        eprintln!("  register            - Register .nxpf file association on Windows (HKCU)");
+        return Ok(());
+    }
+
+    // Allow registering file association: `nxpf register`
+    if args[1] == "register" {
+        #[cfg(windows)]
+        {
+            match register_file_association() {
+                Ok(()) => println!("Successfully registered .nxpf file association for current user."),
+                Err(e) => eprintln!("Registration failed: {}", e),
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            eprintln!("Registration is supported only on Windows.");
+        }
+
         return Ok(());
     }
 
@@ -173,7 +196,8 @@ fn main() -> Result<(), eframe::Error> {
         match nxpf_to_png(file_path) {
             Ok((width, height)) => {
                 let options = eframe::NativeOptions {
-                    resizable: false,
+                    resizable: true,
+                    // allow user to resize window; start at image size
                     initial_window_size: Some(egui::vec2(width as f32, height as f32)),
                     ..Default::default()
                 };
@@ -181,7 +205,7 @@ fn main() -> Result<(), eframe::Error> {
                 eframe::run_native(
                     "NXPF Viewer",
                     options,
-                    Box::new(|_cc| Box::<ImagePreview>::default()),
+                    Box::new(|_cc| Box::new(ImagePreview::default())),
                 )
             }
             Err(e) => {
@@ -194,6 +218,7 @@ fn main() -> Result<(), eframe::Error> {
 
 struct ImagePreview {
     image: RetainedImage,
+    zoom: f32,
 }
 
 impl Default for ImagePreview {
@@ -203,6 +228,7 @@ impl Default for ImagePreview {
 
         Self {
             image: RetainedImage::from_image_bytes(TEMP_RESULT_PATH, &image_data).unwrap(),
+            zoom: 1.0,
         }
     }
 }
@@ -210,7 +236,61 @@ impl Default for ImagePreview {
 impl eframe::App for ImagePreview {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.image.show(ui);
+            ui.horizontal(|ui| {
+                if ui.button("-").clicked() {
+                    self.zoom = (self.zoom / 1.1).clamp(0.1, 10.0);
+                }
+                ui.add(egui::Slider::new(&mut self.zoom, 0.1..=10.0).show_value(true));
+                if ui.button("+").clicked() {
+                    self.zoom = (self.zoom * 1.1).clamp(0.1, 10.0);
+                }
+                if ui.button("Fit").clicked() {
+                    self.zoom = 1.0;
+                }
+            });
+
+            let tex = self.image.texture_id(ctx);
+            let size = self.image.size();
+            let size_vec = egui::vec2(size[0] as f32, size[1] as f32);
+
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                let scaled = size_vec * self.zoom;
+                let image_resp = ui.add(egui::Image::new(tex, scaled));
+
+                // Zoom with mouse wheel while hovering image
+                if image_resp.hovered() {
+                    let scroll = ctx.input(|i| i.scroll_delta).y;
+                    if scroll != 0.0 {
+                        // positive scroll -> zoom in
+                        let factor = 1.0 + scroll * 0.1;
+                        self.zoom = (self.zoom * factor).clamp(0.1, 10.0);
+                    }
+                }
+            });
         });
     }
+}
+
+#[cfg(windows)]
+fn register_file_association() -> Result<(), Box<dyn Error>> {
+    // Use HKCU so admin rights are not required. Associates .nxpf files with this exe.
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+    // Set the file extension default value to a ProgID
+    let (ext, _) = hkcu.create_subkey("Software\\Classes\\.nxpf")?;
+    ext.set_value("", &"nxpf_file")?;
+
+    // Create ProgID key and set display name
+    let (prog, _) = hkcu.create_subkey("Software\\Classes\\nxpf_file")?;
+    prog.set_value("", &"NXPF File")?;
+
+    // Set the open command to this executable
+    let exe_path = std::env::current_exe()?;
+    let cmd = format!("\"{}\" \"%1\"", exe_path.display());
+    let (shell, _) = prog.create_subkey("shell")?;
+    let (open, _) = shell.create_subkey("open")?;
+    let (command, _) = open.create_subkey("command")?;
+    command.set_value("", &cmd)?;
+
+    Ok(())
 }
