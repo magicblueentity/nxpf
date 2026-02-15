@@ -1,171 +1,197 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
 use egui_extras::RetainedImage;
-
-extern crate css_color_parser;
-
-use colors_transform::Rgb;
-use image;
-use image::GenericImageView;
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::PathBuf,
 };
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
 
-use skia_safe::{
-    AlphaType, Color4f, ColorType, EncodedImageFormat, ImageInfo, Paint, Rect, Surface,
-};
+const NXPF_MAGIC: &[u8; 4] = b"NXPF";
+const TEMP_RESULT_PATH: &str = "temp.png";
 
-use css_color_parser::Color as CssColor;
+// Flags byte structure
+const FLAG_HAS_ALPHA: u8 = 0x01;
+const FLAG_COMPRESSED: u8 = 0x02;
 
-static TEMP_RESULT_PATH: &str = "temp.png";
+// Compression types
+const COMPRESSION_NONE: u8 = 0x00;
+const COMPRESSION_DEFLATE: u8 = 0x01;
 
-fn vec_to_u32_ne(bytes: &[u8]) -> u32 {
-    let mut result = [0u8; 4];
-    result.copy_from_slice(bytes);
-    u32::from_ne_bytes(result)
-}
-
-fn png_to_bruh(path: PathBuf) -> Result<(), std::io::Error> {
+fn png_to_nxpf(path: PathBuf, use_compression: bool) -> Result<(), std::io::Error> {
     let img = image::open(&path).expect("File not found!");
-    let mut str = String::new();
-    let mut last_line = 0;
+    let width = img.width();
+    let height = img.height();
 
-    for pixel in img.pixels() {
-        let hex_color = Rgb::from(
-            pixel.2 .0[0] as f32,
-            pixel.2 .0[1] as f32,
-            pixel.2 .0[2] as f32,
-        )
-        .to_css_hex_string();
+    // Convert to RGBA
+    let rgba_img = img.to_rgba8();
+    let mut pixel_data = Vec::new();
 
-        if last_line != pixel.1 {
-            str.push_str("\n");
-            last_line = pixel.1;
-        }
-        str.push_str(&hex_color.replace("#", ""));
+    // Collect all pixel bytes
+    for pixel in rgba_img.pixels() {
+        pixel_data.push(pixel[0]); // R
+        pixel_data.push(pixel[1]); // G
+        pixel_data.push(pixel[2]); // B
+        pixel_data.push(pixel[3]); // A
     }
 
-    if let Some(path_str) = &path.to_str() {
-        let height: u32 = img.height();
-        let width: u32 = img.width();
-
-        let height_bytes: [u8; 4] = height.to_ne_bytes();
-        let width_bytes: [u8; 4] = width.to_ne_bytes();
-        let path_to_bruh = path_str.replace(".png", ".bruh");
-
+    if let Some(path_str) = path.to_str() {
+        let output_path = path_str.replace(".png", ".nxpf");
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
-            .open(path_to_bruh)
-            .expect("Couldnt write");
-        let string_bytes: Vec<u8> = Vec::from(str.as_bytes());
+            .truncate(true)
+            .open(&output_path)
+            .expect("Couldn't create file");
 
-        file.write_all(&width_bytes).unwrap();
-        file.write_all(&height_bytes).unwrap();
-        file.write_all(&string_bytes).unwrap();
-        file.flush().unwrap();
+        // Write magic number
+        file.write_all(NXPF_MAGIC)?;
+
+        // Write width (u32 little-endian)
+        file.write_all(&width.to_le_bytes())?;
+
+        // Write height (u32 little-endian)
+        file.write_all(&height.to_le_bytes())?;
+
+        // Write flags (has alpha = true)
+        let flags = FLAG_HAS_ALPHA | if use_compression { FLAG_COMPRESSED } else { 0 };
+        file.write_all(&[flags])?;
+
+        // Write compression type
+        let compression_type = if use_compression { COMPRESSION_DEFLATE } else { COMPRESSION_NONE };
+        file.write_all(&[compression_type])?;
+
+        // Write pixel data
+        if use_compression {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&pixel_data)?;
+            let compressed = encoder.finish()?;
+            file.write_all(&compressed)?;
+        } else {
+            file.write_all(&pixel_data)?;
+        }
+
+        file.flush()?;
+        println!("Successfully converted PNG to NXPF: {}", output_path);
+        println!("Original size: {} bytes", pixel_data.len());
+        
+        Ok(())
     } else {
-        println!("{}", "couldn't find")
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Invalid path"))
     }
-
-    Ok(())
 }
 
-fn bruh_to_png(path: PathBuf) -> (u32, u32) {
-    let mut contents: Vec<u8> = fs::read(&path).expect("Couldn't read file.");
-    let binding: Vec<_> = contents.drain(0..8).collect();
+fn nxpf_to_png(path: PathBuf) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    let mut file = std::fs::File::open(&path)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
 
-    let width = vec_to_u32_ne(&binding[0..4]);
-    let height = vec_to_u32_ne(&binding[4..8]);
-
-    let sanitized_content = String::from_utf8_lossy(&contents).replace("\n", "");
-
-    let result: Vec<&str> = sanitized_content
-        .as_bytes()
-        .chunks(6)
-        .map(std::str::from_utf8)
-        .collect::<Result<_, _>>()
-        .expect("Invalid UTF-8 sequence in the input string");
-
-    let info = ImageInfo::new(
-        (width as i32, height as i32),
-        ColorType::RGBA8888,
-        AlphaType::Opaque,
-        None,
-    );
-
-    let mut surface = Surface::new_raster(&info, None, None).unwrap();
-    let canvas = surface.canvas();
-
-    for (i, color) in result.iter().enumerate() {
-        let hex = "#".to_owned() + color;
-
-        let parsed_color = hex
-            .parse::<CssColor>()
-            .expect("Failed to convert Hex to RGB");
-        let color4f = Color4f::new(
-            parsed_color.r as f32,
-            parsed_color.g as f32,
-            parsed_color.b as f32,
-            0.004 as f32,
-        );
-        let paint = Paint::new(color4f, None);
-        if i == 0 {
-            println!("{:?}", paint)
-        }
-        let x = i % width as usize;
-        let y = i / width as usize;
-
-        let rect = Rect::from_point_and_size((x as f32, y as f32), (1.0, 1.0));
-        canvas.draw_rect(rect, &paint);
+    if buffer.len() < 14 {
+        return Err("File too small".into());
     }
 
-    let image = surface.image_snapshot();
-
-    if let Some(data) = image.encode(None, EncodedImageFormat::PNG, 100) {
-        fs::write(TEMP_RESULT_PATH, &*data).expect("Failed to write image data to file");
+    // Read magic
+    if &buffer[0..4] != NXPF_MAGIC {
+        return Err("Invalid magic number".into());
     }
 
-    return (width, height);
+    // Read dimensions
+    let width = u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+    let height = u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
+
+    // Read flags and compression
+    let flags = buffer[12];
+    let _compression_type = buffer[13];
+
+    let _has_alpha = (flags & FLAG_HAS_ALPHA) != 0;
+    let is_compressed = (flags & FLAG_COMPRESSED) != 0;
+
+    // Extract pixel data
+    let pixel_data = if is_compressed {
+        let mut decoder = GzDecoder::new(&buffer[14..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed)?;
+        decompressed
+    } else {
+        buffer[14..].to_vec()
+    };
+
+    // Validate data size
+    let expected_size = (width * height * 4) as usize;
+    if pixel_data.len() != expected_size {
+        return Err(format!("Invalid pixel data size: {} vs {}", pixel_data.len(), expected_size).into());
+    }
+
+    // Create image buffer
+    let mut img_buffer = image::RgbaImage::new(width, height);
+    for (i, chunk) in pixel_data.chunks(4).enumerate() {
+        let x = (i as u32) % width;
+        let y = (i as u32) / width;
+        img_buffer.put_pixel(x, y, image::Rgba([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+
+    // Save as PNG
+    img_buffer.save(TEMP_RESULT_PATH)?;
+
+    Ok((width, height))
 }
 
 fn main() -> Result<(), eframe::Error> {
     let args: Vec<String> = env::args().collect();
-    let file_path: PathBuf = (&args[1]).into();
 
-    if &args[1] == "compile" {
+    if args.len() < 2 {
+        eprintln!("Usage: nxpf [compile|view] <path>");
+        eprintln!("  compile <path.png>  - Convert PNG to NXPF");
+        eprintln!("  view <path.nxpf>    - View NXPF file");
+        return Ok(());
+    }
+
+    let command = &args[1];
+
+    if command == "compile" {
         if args.len() < 3 {
-            panic!("Secondary argument ('path') not provided. Example: `cargo run compile ~/image.png`")
+            panic!("Path not provided. Example: `cargo run compile image.png`");
         }
 
-        let path: PathBuf = (&args[2]).into();
+        let path: PathBuf = args[2].clone().into();
+        let use_compression = args.contains(&"--compress".to_string());
 
-        match png_to_bruh(path) {
-            Ok(()) => println!("{}", "Successfully converted PNG to BRUH"),
-            Err(_) => println!("{}", "Failed to convert PNG to BRUH"),
+        match png_to_nxpf(path, use_compression) {
+            Ok(()) => println!("Conversion successful!"),
+            Err(e) => eprintln!("Conversion failed: {}", e),
         }
 
         Ok(())
     } else {
-        let (width, height) = bruh_to_png(file_path);
-        println!("{} {}", width, height);
-        let options = eframe::NativeOptions {
-            resizable: false,
-            initial_window_size: Some(egui::vec2(width as f32, height as f32)),
-            ..Default::default()
-        };
+        let file_path: PathBuf = command.into();
 
-        eframe::run_native(
-            "Image preview",
-            options,
-            Box::new(|_cc| Box::<ImagePreview>::default()),
-        )
+        match nxpf_to_png(file_path) {
+            Ok((width, height)) => {
+                let options = eframe::NativeOptions {
+                    resizable: false,
+                    initial_window_size: Some(egui::vec2(width as f32, height as f32)),
+                    ..Default::default()
+                };
+
+                eframe::run_native(
+                    "NXPF Viewer",
+                    options,
+                    Box::new(|_cc| Box::<ImagePreview>::default()),
+                )
+            }
+            Err(e) => {
+                eprintln!("Failed to load NXPF: {}", e);
+                Ok(())
+            }
+        }
     }
 }
+
 struct ImagePreview {
     image: RetainedImage,
 }
@@ -173,8 +199,7 @@ struct ImagePreview {
 impl Default for ImagePreview {
     fn default() -> Self {
         let image_data = std::fs::read(TEMP_RESULT_PATH).expect("Failed to read image file");
-
-        fs::remove_file(TEMP_RESULT_PATH).expect("File delete failed on TEMP_RESULT_PATH");
+        let _ = fs::remove_file(TEMP_RESULT_PATH);
 
         Self {
             image: RetainedImage::from_image_bytes(TEMP_RESULT_PATH, &image_data).unwrap(),
